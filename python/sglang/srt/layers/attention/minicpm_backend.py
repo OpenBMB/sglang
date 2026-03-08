@@ -1422,6 +1422,10 @@ class MiniCPMSparseBackend(AttentionBackend):
                     # - kv_indptr is PRECOMPUTED: [0, topk, 2*topk, ...]
                     # - Buffers are updated each replay by flattening sparse_page_table
                     "flashinfer_kv_indptr": precomputed_kv_indptr,
+                    # Read-only copy: restored before each wrapper.begin_forward()
+                    # because convert_sparse_page_table_to_flashinfer overwrites
+                    # the buffer in-place during CUDA graph replay
+                    "flashinfer_kv_indptr_original": precomputed_kv_indptr.clone(),
                     "flashinfer_kv_indices": torch.zeros(
                         max_bs * 2 * self.num_sparse_topk_tokens,
                         dtype=torch.int32,
@@ -1610,9 +1614,16 @@ class MiniCPMSparseBackend(AttentionBackend):
                 sparse_bs = bs * 2
 
                 # Get batch-sized SLICE VIEWS of pre-allocated buffers
+                # Restore precomputed values first in case a previous capture
+                # corrupted them via convert_sparse_page_table_to_flashinfer
                 kv_indptr_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_indptr"
                 ][: sparse_bs + 1]
+                kv_indptr_view.copy_(
+                    self.decode_cuda_graph_metadata["flashinfer_kv_indptr_original"][
+                        : sparse_bs + 1
+                    ]
+                )
                 kv_indices_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_indices"
                 ][: sparse_bs * self.num_sparse_topk_tokens]
@@ -1752,10 +1763,17 @@ class MiniCPMSparseBackend(AttentionBackend):
                 sparse_real_bs = real_bs * 2
 
                 # Get views of pre-allocated buffers
-                # kv_indptr is precomputed and static: [0, 1*K, 2*K, ..., sparse_bs*K]
+                # Restore precomputed kv_indptr first: convert_sparse_page_table_to_flashinfer
+                # overwrites this buffer in-place during CUDA graph replay via the wrapper's
+                # _paged_kv_indptr_buf alias, corrupting it with dynamic per-request values.
                 kv_indptr_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_indptr"
                 ][: sparse_bs + 1]
+                kv_indptr_view.copy_(
+                    self.decode_cuda_graph_metadata["flashinfer_kv_indptr_original"][
+                        : sparse_bs + 1
+                    ]
+                )
                 # kv_indices only needs num_sparse_topk_tokens per batch
                 kv_indices_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_indices"
@@ -1763,7 +1781,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 kv_last_page_len_view = self.decode_cuda_graph_metadata[
                     "flashinfer_kv_last_page_len"
                 ][:sparse_bs]
-                kv_indptr_view[sparse_real_bs:].fill_(kv_indptr_view[-1])
+                kv_indptr_view[sparse_real_bs:].fill_(kv_indptr_view[sparse_real_bs])
                 kv_last_page_len_view[sparse_real_bs:].fill_(0)
 
                 # Retrieve the wrapper stored during capture
